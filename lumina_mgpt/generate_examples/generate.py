@@ -27,11 +27,9 @@ if __name__ == "__main__":
     print("args:\n", args)
 
     select_set1 = [
-        "Image of a dog playing water, and a water fall is in the background.",
-        "A family of asian people sitting around the dinner table, eating and laughing.",
-        "A high-resolution photograph of a middle-aged woman with curly hair, wearing traditional Japanese kimono, smiling gently under a cherry blossom tree in full bloom.",  # noqa
-        "Image of a bustling downtown street in Tokyo at night, with neon signs, crowded sidewalks, and tall skyscrapers.",  # noqa
-        "Image of a quiet European village with cobblestone streets and colorful houses, under a clear blue sky.",
+        "Generate an image of 512x512:",
+        "",
+        "Generate an image of 512x512 according to the following prompt:\nA photo of a cat sitting on a skateboard in the middle of the street",
     ]
 
     l_prompts = select_set1
@@ -54,15 +52,21 @@ if __name__ == "__main__":
                 random_seed(repeat_idx)
                 generated = inference_solver.generate(
                     images=[],
-                    qas=[[f"Generate an image of {w}x{h} according to the following prompt:\n{prompt}", None]],
+                    qas=[[prompt, None]],
                     max_gen_len=8192,
                     temperature=t,
                     logits_processor=inference_solver.create_logits_processor(cfg=cfg, image_top_k=top_k),
                 )
                 try:
                     l_generated_all.append(generated[1][0])
+                    print(f"Completed prompt {i+1}/{len(l_prompts)}")
+                    generated[1][0].save(f"./exps/debug/prompt_{i}.png")
+                    print(f"Generated image with shape: {generated[1][0].size}")
                 except:
+                    print("Generation failed!")
+                    print(generated)
                     l_generated_all.append(Image.new("RGB", (w, h)))
+           
 
         result_image = inference_solver.create_image_grid(l_generated_all, len(l_prompts), n)
         result_image.save(args.save_path)

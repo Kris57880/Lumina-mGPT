@@ -167,3 +167,8 @@ tokenizer.model
 *.swp
 
 .asset/
+lumina_mgpt/exps/*
+lumina_mgpt/codebook_remap_*
+lumina_mgpt/log/*
+lumina_mgpt/*2.sh
+lumina_mgpt/ckpts/*
