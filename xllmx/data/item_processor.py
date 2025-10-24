@@ -249,6 +249,61 @@ class MMConvItemProcessor(ItemProcessorBase):
             return tokens, labels
         else:
             return tokens
+    
+    def tokenize_item(self, data_item: dict, training_mode=False) -> Tuple[List, List]:
+        data_item = self.preprocess_item(data_item)
+
+        d_media = self.collect_and_process_media(data_item)
+        
+        images_tokens = d_media['<|image|>'][0]['input_ids']
+
+        source = data_item["conversations"]
+
+        # implicit_at_beginning means media without explict location specification are arranged right after bos token
+        # if false, then these medias are arranged at the beginning of the first question
+        if not self.implicit_at_beginning:
+            source = self.insert_implicit_media_symbol_in_q1(source, d_media)
+
+        conversation, pieces = self.add_speaker_and_signal(source)
+
+        if self.implicit_at_beginning:
+            conversation = self.insert_implicit_media_symbol_at_beginning(conversation, d_media)
+
+        # dialog does not need eos
+        tokens = self.tokenizer.encode(conversation, bos=True, eos=False)
+        labels = [-100 for _ in tokens]
+
+        # check special token num as expected
+        for media_symbol, l_media in d_media.items():
+            media_token = self.d_media_symbol2token[media_symbol]
+            media_token_count = tokens.count(media_token)
+            assert media_token_count == len(l_media), (
+                f"{media_token_count} {media_token} (for {media_symbol}) exists in tokenized conversation, "
+                f"but {len(l_media)} actual media are given"
+            )
+
+        check_pos = 0
+        for i, p in enumerate(pieces):
+            if i == 0:
+                tokenized_value = self.tokenizer.encode(p["data"], bos=True, eos=False)
+            else:
+                tokenized_value = self.tokenizer.encode_wo_prefix_space(p["data"])
+
+            assert (
+                tokens[check_pos : check_pos + len(tokenized_value)] == tokenized_value
+            ), "inconsistent complete conversation and corresponding piece after tokenization"
+
+            if p["predict"]:
+                labels[check_pos : check_pos + len(tokenized_value)] = tokenized_value
+
+            check_pos = check_pos + len(tokenized_value)
+
+        # labels will be processed later by the model
+        tokens, labels = self.replace_media_token_with_media(tokens, labels, d_media)
+
+        assert len(tokens) == len(labels)
+
+        return images_tokens, tokens
 
     def predict_item_token_length(self, data_item: dict) -> int:
         """

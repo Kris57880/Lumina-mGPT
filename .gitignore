@@ -167,3 +167,10 @@ tokenizer.model
 *.swp
 
 .asset/
+
+
+lumina_mgpt/image_kodak
+lumina_mgpt/exps/*
+lumina_mgpt/*2.sh
+lumina_mgpt/ckpts/*
+lumina_mgpt/results/*

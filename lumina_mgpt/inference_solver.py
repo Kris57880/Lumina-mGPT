@@ -330,7 +330,7 @@ class FlexARInferenceSolver:
             max_length=self.model.config.max_position_embeddings,
             temperature=temperature,
             top_k=None,
-            do_sample=True,
+            do_sample=False,
             eos_token_id=[8710],
         )
 
@@ -346,10 +346,102 @@ class FlexARInferenceSolver:
 
         return self.decode_ids(generation_result)
 
+    @torch.no_grad()
+    def compress(
+        self,
+        images: Image.Image | str | List[Union[Image.Image, str]],
+        qas,
+        max_gen_len,
+        temperature,
+        logits_processor=None,
+        streamer=None,
+    ):
+        start_time_cuda_encode = torch.cuda.Event(enable_timing=True)
+        end_time_cuda_encode = torch.cuda.Event(enable_timing=True)
+        start_time_cuda_decode = torch.cuda.Event(enable_timing=True)
+        end_time_cuda_decode = torch.cuda.Event(enable_timing=True)
+
+        import time
+        start_time_encode = time.time()
+        start_time_cuda_encode.record()
+
+        conversations = []
+        for q, a in qas:
+            conversations.append(
+                {
+                    "from": "human",
+                    "value": q,
+                }
+            )
+            conversations.append(
+                {
+                    "from": "gpt",
+                    "value": a,
+                }
+            )
+        item = {"image": images, "conversations": conversations}
+
+        
+        image_tokens, _prompt = self.item_processor.tokenize_item(item)
+        
+        prompt = []
+        for value in _prompt:
+            if isinstance(value, int):
+                prompt.append(value)
+            else:
+                prompt += value["input_ids"]
+        prompt_len = len(prompt)
+        prompt = torch.tensor(prompt, dtype=torch.int64, device=self.model.device).unsqueeze(0)
+
+        generation_config = GenerationConfig(
+            max_new_tokens=max_gen_len,
+            max_length=self.model.config.max_position_embeddings,
+            temperature=temperature,
+            top_k=None,
+            do_sample=True,
+            eos_token_id=[8710],
+        )
+
+        if logits_processor is None:
+            logits_processor = self.create_logits_processor()
+
+        start_time_decode = time.time()
+        start_time_cuda_decode.record()
+        
+        with torch.cuda.amp.autocast(dtype=self.dtype):
+            # import pdb; pdb.set_trace()
+            outputs = self.model.generate(
+                prompt, generation_config, logits_processor=logits_processor, streamer=streamer
+            )
+            generation_result = outputs[0][prompt_len:].tolist()
+            
+            if len(generation_result) > 0 and generation_result[-1] == 8710:
+                generation_result = generation_result[:-1]
+        
+        end_time_encode = time.time()
+        end_time_cuda_encode.record()
+        torch.cuda.synchronize()
+        
+        # output = self.decode_ids(image_tokens)
+        output = self.decode_ids(generation_result)
+        
+        end_time_decode = time.time()
+        end_time_cuda_decode.record()
+        torch.cuda.synchronize()
+        
+        # print(f"Encode time: {end_time_encode - start_time_encode:.3f} seconds")
+        # print(f"Decode time: {end_time_decode - start_time_decode:.3f} seconds")
+        
+        print(f"CUDA Encode time: {start_time_cuda_encode.elapsed_time(end_time_cuda_encode):.3f} ms")
+        print(f"CUDA Decode time: {start_time_cuda_decode.elapsed_time(end_time_cuda_decode):.3f} ms")
+        
+        return output
+
     def decode_ids(self, tokens: List[int]):
         generated_images = []
         generation_result_processed = []
         i = 0
+        print(len(tokens))
         while i < len(tokens):
             token_id = tokens[i]
             if token_id == self.item_processor.token2id(self.item_processor.image_start_token):

@@ -27,11 +27,7 @@ if __name__ == "__main__":
     print("args:\n", args)
 
     select_set1 = [
-        "Image of a dog playing water, and a water fall is in the background.",
-        "A family of asian people sitting around the dinner table, eating and laughing.",
-        "A high-resolution photograph of a middle-aged woman with curly hair, wearing traditional Japanese kimono, smiling gently under a cherry blossom tree in full bloom.",  # noqa
-        "Image of a bustling downtown street in Tokyo at night, with neon signs, crowded sidewalks, and tall skyscrapers.",  # noqa
-        "Image of a quiet European village with cobblestone streets and colorful houses, under a clear blue sky.",
+        "",
     ]
 
     l_prompts = select_set1
@@ -53,8 +49,8 @@ if __name__ == "__main__":
             for repeat_idx in range(n):
                 random_seed(repeat_idx)
                 generated = inference_solver.generate(
-                    images=[],
-                    qas=[[f"Generate an image of {w}x{h} according to the following prompt:\n{prompt}", None]],
+                    images=[Image.open("/home/kris/generation_for_compression/dataset/image_kodak/kodim04.png")],
+                    qas=[[f"", None]],
                     max_gen_len=8192,
                     temperature=t,
                     logits_processor=inference_solver.create_logits_processor(cfg=cfg, image_top_k=top_k),
@@ -63,6 +59,7 @@ if __name__ == "__main__":
                     l_generated_all.append(generated[1][0])
                 except:
                     l_generated_all.append(Image.new("RGB", (w, h)))
+                    print(f"Warning: Generation failed for prompt {i}, repeat {repeat_idx}")
 
         result_image = inference_solver.create_image_grid(l_generated_all, len(l_prompts), n)
         result_image.save(args.save_path)
