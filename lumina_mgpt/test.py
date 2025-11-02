@@ -6,6 +6,7 @@ import torchvision.transforms as transforms
 import torch.nn.functional as F
 import os
 import csv
+import numpy as np
 import argparse
 
 
@@ -45,26 +46,32 @@ parser.add_argument('--allow_generation', action='store_true', help='Allow gener
 parser.add_argument('--generate_mode', type=str, default="None", help='Mode for generation in compression')
 parser.add_argument('--generate_prob', type=float, default=0, help='Probability for generation in compression')
 parser.add_argument('--generate_conf_thres', type=float, default=1, help='Confidence threshold for generation in compression')
+parser.add_argument('--gen_every_n_tokens', type=int, default=1, help='Generate every n tokens (only for generate_mode=gen-every-n)')
 parser.add_argument('--input_folder', type=str, default="/home/kris/generation_for_compression/dataset/image_kodak", help='Path to input folder containing images')
+parser.add_argument('--input_caption_file', type=str, default="", help='Path to input caption CSV file')
+parser.add_argument('--input_confidence_folder', type=str, default="", help='Path to input folder containing confidence scores for each image')
+parser.add_argument('--input_size', type=int, default=768, help='Input image size (default: 768)')
 parser.add_argument('--output_csv', type=str, default="kodak_results.csv", help='Output CSV file name')
 parser.add_argument('--output_folder', type=str, default="results/kodak_gen", help='Output folder for generated images and results')
-
+parser.add_argument('--cfg', type=float, default=1.0, help='CFG scale for logits processor (default: 1.0/disabled)')
+parser.add_argument('--enable_img_cond', action='store_true', help='Use condition images during compression')
+parser.add_argument('--cond_size', type=int, default=256, help='Use smaller image to help entropy coding, conditioning image size (default: 256)')
 args = parser.parse_args()
 
 inference_solver = FlexARInferenceSolver(
     model_path="Alpha-VLLM/Lumina-mGPT-7B-768-Omni",
     # model_path="Alpha-VLLM/Lumina-mGPT-7B-768",
     precision="fp16",
-    target_size=768,
+    target_size=args.input_size,
 )
 
-inference_solver.model.logits_processor = inference_solver.create_logits_processor(cfg=1.0, image_top_k=200)
+inference_solver.model.logits_processor = None
 inference_solver.model.compression = True
 inference_solver.model.allow_generation = args.allow_generation
 inference_solver.model.gen_mode = args.generate_mode
 inference_solver.model.gen_prob = args.generate_prob  # set generation probability
 inference_solver.model.gen_conf_thres = args.generate_conf_thres
-
+inference_solver.model.gen_every_n = args.gen_every_n_tokens
 # print model parameters size
 # model_size = sum(p.numel() for p in inference_solver.model.parameters() if p.requires_grad)
 # print("AR Model Parameters:")
@@ -81,11 +88,30 @@ inference_solver.model.gen_conf_thres = args.generate_conf_thres
 input_folder = args.input_folder
 output_csv = args.output_csv
 output_folder = args.output_folder
+caption_csv = args.input_caption_file
 
 image_limit = -1 
 
 # 創建輸出文件夾
 os.makedirs(output_folder, exist_ok=True)
+
+# 讀取 caption CSV 檔案
+caption_dict = {}
+if os.path.exists(caption_csv):
+    print(f"讀取 caption 檔案: {caption_csv}")
+    try:
+        with open(caption_csv, 'r', encoding='utf-8') as f:
+            csv_reader = csv.DictReader(f)
+            for row in csv_reader:
+                image_name = row.get('image_name', '')
+                caption = row.get('caption', '')
+                if image_name and caption:
+                    caption_dict[image_name] = caption
+        print(f"成功讀取 {len(caption_dict)} 個圖片的 caption")
+    except Exception as e:
+        print(f"讀取 caption 檔案時出錯: {e}")
+else:
+    print(f"警告: caption 檔案不存在: {caption_csv}")
 
 # 準備結果列表
 results = []
@@ -128,8 +154,50 @@ for i, image_name in enumerate(img_list):
     # 載入圖片
     original_image = Image.open(image_path)
     images = [original_image]
-    qas = [["", None]]
+    
+    # 構建 description，包含 caption 資訊
+    description = ""
+    # 從 caption_dict 中獲取該圖片的 caption
+    if image_name in caption_dict:
+        description = "Generate an image of 768x768 according to the following prompt:\n"
+        caption = caption_dict[image_name]
+        description += caption
+    else:
+        print(f"  警告: 未找到 {image_name} 的 caption")
+    
+    if args.enable_img_cond:
+        print("  使用條件圖片進行壓縮")
+        description =  "Generate an image of 768x768 according to this low-resolution image <|image|>. Preserve the original content, composition, and colors. Enhance sharpness, texture, and fine details WITHOUT altering the scene or adding new elements."
+    description_bits = len(description) * 8 
+    if len(description) > 0:
+        print(f"Use description (len: {len(description)}/ bits: {description_bits}): {description}")  # 只顯示前 100 個字元
 
+    qas = [[description, None]]
+
+    # get confidence map if provided
+    confidence_map = {}
+    confidence_list = []
+    confidence_rank = []
+    if args.input_confidence_folder:
+        confidence_path = os.path.join(args.input_confidence_folder, f"{os.path.splitext(image_name)[0]}_token_entropy.csv")
+        if os.path.exists(confidence_path):
+            with open(confidence_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                confidence_list = [
+                    float(row['distribution_entropy'])
+                    for row in reader
+                    if row.get('distribution_entropy')
+                ]
+                print(f"成功讀取 {len(confidence_list)} 個 token 的置信度")
+            
+        else:
+            print(f"警告: 找不到置信度檔案: {confidence_path}")
+
+    # sort the confidence list to get the rank
+    sorted_idx = np.argsort(confidence_list)
+    rank = np.argsort(sorted_idx)
+    confidence_map = {'list': confidence_list, 'rank': rank.tolist()}
+    
     # Create CUDA events
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -139,12 +207,17 @@ for i, image_name in enumerate(img_list):
     torch.cuda.synchronize() 
 
     # 進行壓縮
+    inference_solver.model.to_compressed_tok=[]  # original image that need to be compressed
+    inference_solver.model.confidence_map = confidence_map
+    inference_solver.model.prefilled = False 
+
     generated = inference_solver.compress(
         images=images,
         qas=qas,
-        max_gen_len=2352+7,
+        max_gen_len=-1,
         temperature=1.0,
-        logits_processor=inference_solver.create_logits_processor(cfg=1.0, image_top_k=200),
+        logits_processor= inference_solver.create_logits_processor(cfg=args.cfg, image_top_k=200),
+        condition_images= [img.resize((args.cond_size, args.cond_size)) for img in images] if args.enable_img_cond else None,
     )
     
     torch.cuda.synchronize() # Ensures the "kernel" completes before recording the end event
@@ -172,12 +245,12 @@ for i, image_name in enumerate(img_list):
     
     
     likelihoods = torch.tensor(inference_solver.model.likelihoods, dtype=torch.float32)
-    tokens_to_transmit = torch.tensor(inference_solver.model.token_to_transmit, dtype=torch.int16)
-    # First token and special tokens
-    likelihoods[:3] = likelihoods[-1] = 1.0
+    # tokens_to_transmit = torch.tensor(inference_solver.model.token_to_transmit, dtype=torch.int16)
+    # print(f'likelihood.shape: {likelihoods.shape}, tokens_to_transmit.shape: {tokens_to_transmit.shape}')
+    # likelihoods[:3] = likelihoods[-1] = 1.0
 
     # 8803 is the End-of-Line token
-    likelihoods[torch.where(tokens_to_transmit == 8803)] = 1.0
+    # likelihoods[torch.where(tokens_to_transmit == 8803)] = 1.0 # special token's likelihood already set to 1.0 during model forward
     tok_entropy= -torch.log2(likelihoods)
     tok_distri_entropy = torch.tensor(inference_solver.model.entropy_per_tok_distribution, dtype=torch.float32)
 
@@ -187,7 +260,8 @@ for i, image_name in enumerate(img_list):
 
     # 計算壓縮率
     total_bits = compute_rate(likelihoods)
-    total_bits += 13 # First Token
+    # total_bits += 13 
+    total_bits += description_bits 
     bpp = total_bits / (original_image_tensor.shape[2] * original_image_tensor.shape[3])
     
     # 計算圖像品質指標
@@ -199,6 +273,7 @@ for i, image_name in enumerate(img_list):
     result = {
         'image_name': image_name,
         'total_bits': total_bits.item(),
+        'description_bits': description_bits,
         'bpp': bpp.item(),
         'psnr': psnr_score,
         'ms_ssim': ms_ssim_score.item(),
@@ -216,6 +291,7 @@ for i, image_name in enumerate(img_list):
         plt.plot(tok_distri_entropy.numpy(), label='Entropy per Token')
         plt.xlabel('Token Index')
         plt.ylabel('Entropy (bits)')
+        plt.ylim(0, 25)
         plt.title(f'Entropy Distribution for {image_name}')
         plt.legend()
         plt.grid()
@@ -224,6 +300,7 @@ for i, image_name in enumerate(img_list):
         plt.xlabel('Token Index')
         plt.ylabel('Entropy (bits)')
         plt.title(f'Entropy each tokens for {image_name}')
+        plt.ylim(0, 25)
         plt.legend()
         plt.grid()
         plt.tight_layout()
@@ -234,6 +311,8 @@ for i, image_name in enumerate(img_list):
         plt.scatter(tok_distri_entropy.numpy(), tok_entropy.numpy(), alpha=0.5)
         plt.xlabel('Distribution Entropy (bits)')
         plt.ylabel('Token Predict Entropy(bits)')
+        plt.xlim(0, 13)
+        plt.ylim(0, 25)
         plt.title(f'Entropy Scatter Plot for {image_name}')
         plt.grid()
         plt.savefig(os.path.join(output_folder, f"{image_name}_entropy_scatter.png"))
@@ -270,6 +349,19 @@ for i, image_name in enumerate(img_list):
         plt.savefig(os.path.join(output_folder, f"{image_name}_token_entropy_heatmap.png"))
         plt.close()
 
+    # save tok_distri_entropy and tok_entropy to a csv file
+    with open(os.path.join(output_folder, f"{image_name.split('.')[0]}_token_entropy.csv"), 'w', newline='', encoding='utf-8') as csvfile:
+        fieldnames = ['token_index', 'distribution_entropy', 'token_entropy']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for idx in range(len(tok_entropy)):
+            writer.writerow({
+                'token_index': idx,
+                'distribution_entropy': tok_distri_entropy[idx].item(),
+                'token_entropy': tok_entropy[idx].item(),
+            })
+        
+
 
 
 
@@ -279,7 +371,7 @@ for i, image_name in enumerate(img_list):
 
 # 將結果保存到CSV文件
 with open(output_csv, 'w', newline='', encoding='utf-8') as csvfile:
-    fieldnames = ['image_name', 'total_bits', 'bpp', 'psnr', 'ms_ssim', 'lpips', 'elapsed_time_sec']
+    fieldnames = ['image_name', 'total_bits', 'description_bits', 'bpp', 'psnr', 'ms_ssim', 'lpips', 'elapsed_time_sec']
     writer = csv.DictWriter(csvfile, fieldnames=fieldnames, delimiter='\t')
     
     writer.writeheader()
@@ -326,11 +418,37 @@ if plot_figure:
     plt.scatter(all_tok_distri_entropy.numpy(), all_tok_entropy.numpy(), alpha=0.5)
     plt.xlabel('Distribution Entropy (bits)')
     plt.ylabel('Token Predict Entropy (bits)')
+    plt.xlim(0, 13)
+    plt.ylim(0, 25)
     plt.title(f'Entropy Scatter Plot for All Images')
     plt.grid()
     plt.savefig(os.path.join(output_folder, f"all_images_entropy_scatter.png"))
     plt.close()
     print(f" Save overall entropy scatter figure to {os.path.join(output_folder, f'all_images_entropy_scatter.png')}")
+
+    # plot histogram of token entropy distribution
+    plt.figure(figsize=(12, 8))
+    plt.rcParams.update({'font.size': 16})  # 全部字體大小
+    plt.hist(all_tok_entropy.numpy(), bins=100, range=(0, 25), alpha=0.7, color='green', edgecolor='black')
+    plt.xlabel('Token Predict Entropy (bits)')
+    plt.ylabel('Frequency')
+    plt.title('Histogram of Token Predict Entropy for All Images')
+    plt.grid()
+    plt.savefig(os.path.join(output_folder, f"all_images_token_entropy_histogram.png"))
+    plt.close()
+    print(f" Save overall token entropy histogram to {os.path.join(output_folder, f'all_images_token_entropy_histogram.png')}")
+    
+    # plot histogram of entropy distribution
+    plt.figure(figsize=(12, 8))
+    plt.rcParams.update({'font.size': 16})  # 全部字體大小
+    plt.hist(all_tok_distri_entropy.numpy(), bins=100, range=(0, 13), alpha=0.7, color='blue', edgecolor='black')
+    plt.xlabel('Distribution Entropy (bits)')
+    plt.ylabel('Frequency')
+    plt.title('Histogram of Token Distribution Entropy for All Images')
+    plt.grid()
+    plt.savefig(os.path.join(output_folder, f"all_images_token_distribution_entropy_histogram.png"))
+    plt.close()
+    print(f" Save overall token distribution entropy histogram to {os.path.join(output_folder, f'all_images_token_distribution_entropy_histogram.png')}")
 
 print(f"\n結果已保存到: {output_csv}")
 print(f"重建圖片保存在: {output_folder}/")

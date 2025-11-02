@@ -1468,11 +1468,24 @@ class ChameleonForConditionalGeneration(ChameleonPreTrainedModel):
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         
+        # config for compression
         self.compression = False
         self.allow_generation = False
         self.gen_mode = "random" # "random" or "confidence-based"
         self.gen_prob = None  # probability of generating a token instead of transmitting it
         self.gen_conf_thres = 1  # default confidence threshold for compression
+        # self.image_start_pos = 1  # 1 if no text prompt
+        self.num_image_tokens = 2356 # 2356 for 768x768 image
+        self.to_compressed_tok=[]  # original image that need to be compressed
+        self.confidence_map = {}
+        self.prefilled = False 
+        self.gen_every_n = 2  # number of tokens to generate between transmitted tokens
+        # State updated during compression-only decoding.
+        self.current_compression_pos = -1
+        self.likelihoods = []
+        self.entropy_per_tok_distribution = []
+        self.is_generated = []
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1493,6 +1506,21 @@ class ChameleonForConditionalGeneration(ChameleonPreTrainedModel):
 
     def get_decoder(self):
         return self.model
+
+    def reset_compression_state(self):
+        """Clear bookkeeping arrays before a new compression run."""
+        self.likelihoods = []
+        self.entropy_per_tok_distribution = []
+        self.is_generated = []
+        self.current_compression_pos = 0
+
+    def record_compression_step(self, likelihood=None, entropy=None, is_generated=False):
+        """Append statistics for the latest decoded token."""
+        if likelihood is not None:
+            self.likelihoods.append(float(likelihood))
+        if entropy is not None:
+            self.entropy_per_tok_distribution.append(float(entropy))
+        self.is_generated.append(bool(is_generated))
 
     @add_start_docstrings_to_model_forward(CHAMELEON_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
@@ -1540,44 +1568,31 @@ class ChameleonForConditionalGeneration(ChameleonPreTrainedModel):
         >>> generated_ids = model.generate(**inputs, max_new_tokens=100, do_sample=False)
         >>> processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
         ```"""
-        # For compression, mask future image tokens
+        # print(f"input_ids: {input_ids}")
+        
+        # update attention mask & compression bookkeeping
         if self.compression:
-            device = input_ids.device if input_ids is not None else attention_mask.device
-            
-            if input_ids.shape[1] > 1: # init
+            if not self.prefilled:
+                print("Prefill Stage")
                 self.full_length = input_ids.shape[1] if input_ids is not None else attention_mask.shape[1]
                 self.attention_mask = attention_mask
-                self.original_seq = input_ids # a backup of original sequence （full image tokens and prompt）
-                self.likelihoods = []
-                self.token_to_transmit = []
-                self.entropy_per_tok_distribution = []
-                corresponding_pos = 0
-                self.is_generated = []  
-                generate_this_tok = False
+                self.reset_compression_state()
+                self.prefilled = True
+            else:
+                self.attention_mask = attention_mask
 
-            else: # autoregressive
-                generate_this_tok = False
-                pos = position_ids[0, 0].item() if position_ids is not None else 0
-                if self.full_length == pos:
-                    self.attention_mask = torch.zeros((1, self.full_length), device=device, dtype=torch.float32)
-                    self.attention_mask[:, :4] = 1. # First token and special tokens
-                    self.attention_mask[:, -3:] = 1. # Last token and special tokens
-                    # self.attention_mask[torch.where(self.original_seq == 8803)] = 1. # End-of-Line token
-                    
-                corresponding_pos = pos - self.full_length + 1
-                self.attention_mask[:, corresponding_pos] = 1.
-                self.attention_mask = torch.cat([self.attention_mask, torch.ones((1, 1), device=device)], dim=1)
-                if len(self.is_generated) != 0 and self.is_generated[-1]: # if previous token is generated, record it
-                    self.token_to_transmit.append(input_ids[:, 0].item()) 
-
-                if corresponding_pos + 1 < self.original_seq.shape[1]: # sometimes it will generate too many tokens
-                    if not self.allow_generation or not self.is_generated[-1]:
-                        input_ids[:, 0] = self.original_seq[:, corresponding_pos] # force to use original token
-                else:
-                    print("Warning: generated sequence is longer than original sequence.")
-                # print(f'Position: {pos}, Corresponding Pos: {corresponding_pos}, Full Length: {self.full_length}')
+            if position_ids is not None and position_ids.shape[1] == 1:
+                pos = position_ids[0, 0].item()
+                self.current_compression_pos = pos - getattr(self, "full_length", 0) + 1
+            elif cache_position is not None and cache_position.shape[0] == 1:
+                pos = cache_position[0].item()
+                self.current_compression_pos = pos - getattr(self, "full_length", 0) + 1
+            # else:
+            #     print('here')
+            #     self.current_compression_pos = -1
         else:
             self.attention_mask = attention_mask
+            self.current_compression_pos = -1
         
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1606,8 +1621,8 @@ class ChameleonForConditionalGeneration(ChameleonPreTrainedModel):
 
         if self.config.mask_image_logits:
             # Disallow image tokens which does not include special begin-image and end-image tokens
-            image_tokens = self.model.vocabulary_mapping.image_tokens
-            logits[:, :, image_tokens] = torch.finfo(logits.dtype).min
+            vocab_img_tok = self.model.vocabulary_mapping.image_tokens
+            logits[:, :, vocab_img_tok] = torch.finfo(logits.dtype).min
 
         loss = None
         if labels is not None:
@@ -1625,50 +1640,6 @@ class ChameleonForConditionalGeneration(ChameleonPreTrainedModel):
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
-
-        if self.compression:
-            # Compute likelihood
-            next_token_logits = logits[:, -1, :].clone().float() # only consider image tokens 
-            next_token_logits = next_token_logits.to(input_ids.device)
-            # suppress tokens which are not for image
-            image_tokens = self.model.vocabulary_mapping.image_tokens
-            non_image_mask = ~torch.isin(torch.arange(next_token_logits.shape[-1], device=next_token_logits.device), torch.tensor(image_tokens, device=next_token_logits.device))
-            next_token_logits = next_token_logits.masked_fill(non_image_mask, torch.finfo(next_token_logits.dtype).min)
-            # next_token_logits = self.logits_processor(input_ids, next_token_logits)
-
-            
-
-            if corresponding_pos + 1 < self.original_seq.shape[1]:
-                # determin whether to generate or transmit
-                probs = nn.functional.softmax(next_token_logits, dim=-1)
-                # calculate entropy for prob
-                log_probs = nn.functional.log_softmax(next_token_logits, dim=-1)
-                entropy = -(probs * log_probs).sum(dim=-1) / torch.log(torch.tensor(2.0))
-                self.entropy_per_tok_distribution.append(entropy.item())
-                if self.allow_generation:
-                    if self.gen_mode == "random":
-                        generate_this_tok = torch.rand(1).item() < self.gen_prob
-                    elif self.gen_mode == "confidence-based": # base on distribution's confidence
-                        full_codebook_size = len(image_tokens)
-                        max_entropy = torch.log(torch.tensor(full_codebook_size)) / torch.log(torch.tensor(2.0))
-                        # print(f'Entropy: {entropy.item()}, Max Entropy: {max_entropy.item()} (Full codebook size: {full_codebook_size})')
-                        generate_this_tok = (1 - entropy / max_entropy).item() >  self.gen_conf_thres #generate if the confidence is high enough
-                    else :
-                        raise ValueError("Invalid generation mode. Choose either 'random' or 'confidence-based'.")
-
-                if  generate_this_tok: # generate mode
-                    self.likelihoods.append(1)  # Special tokens
-                else : # transmit mode
-                    correct_token = self.original_seq[:, corresponding_pos + 1].item()
-                    if correct_token  in image_tokens:
-                        self.likelihoods.append(probs[:, correct_token].item())
-                    else: 
-                        self.likelihoods.append(1)  # Special tokens
-                    self.token_to_transmit.append(correct_token)
-                    # force the logit to be the correct token
-                    logits[:, -1, :] = torch.finfo(logits.dtype).min
-                    logits[:, -1, correct_token] = 1.0  # set to one
-            self.is_generated.append(generate_this_tok)
 
         return CausalLMOutputWithPast(
             loss=loss,

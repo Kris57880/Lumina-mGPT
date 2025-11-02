@@ -121,14 +121,150 @@ class LLMImageStartTriggeredUnbatchedClassifierFreeGuidanceLogitsProcessor(Logit
                     return scores
 
                 unconditional_logits = self.get_unconditional_logits(input_ids, self.image_start_token_id_index)[:, -1]
-
                 scores_processed = self.guidance_scale * (scores - unconditional_logits) + unconditional_logits
                 return scores_processed
 
         else:
             print("Something wrong in the decoding process.")
+            print(f"Start token id index: {self.image_start_token_id}, End token id index: {self.image_end_token_id}")
+            print(f"Num Start Tokens: {num_image_start_tokens}, Num End Tokens: {num_image_end_tokens}")
 
         return scores
+
+
+class ForceToCompressTokenLogitsProcessor(LogitsProcessor):
+    """Records post-CFG scores and optionally forces the next compressed token."""
+    def __init__(
+        self,
+        model: ChameleonForConditionalGeneration,
+        image_start_token_id: int,
+        image_end_token_id: int,
+    ):
+        self.model = model
+        self.image_start_token_id = image_start_token_id
+        self.image_end_token_id = image_end_token_id
+        self._inside_image = False
+        self._image_token_set = set(self.model.model.vocabulary_mapping.image_tokens)
+        self._image_token_tensor = None
+        self._prefilled = False
+        print(f'Image start token id: {self.image_start_token_id}, Image end token id: {self.image_end_token_id}, Number of image tokens: {len(self._image_token_set)}')
+    
+    # def _reset(self):
+    #     self._inside_image = False
+    #     self._image_token_tensor = None
+    #     self.model.current_compression_pos = -1
+
+    def _get_image_token_tensor(self, device):
+        if self._image_token_tensor is None or self._image_token_tensor.device != device:
+            self._image_token_tensor = torch.tensor(list(self._image_token_set), device=device, dtype=torch.long)
+        return self._image_token_tensor
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        # Only act during compression decoding after the prefill step.
+        # print(f'Input IDs: {input_ids}')
+    
+        corresponding_pos = getattr(self.model, "current_compression_pos", -1)
+        # print(f"Current compression position: {corresponding_pos}")
+        if corresponding_pos >= len(self.model.to_compressed_tok): # Out of bounds
+            return scores
+        
+        correct_token = int(self.model.to_compressed_tok[corresponding_pos])
+        # print(f'Correct token to force: {correct_token}')
+        num_image_start_tokens = (input_ids[0] == self.image_start_token_id).sum()
+        num_image_end_tokens = (input_ids[0] == self.image_end_token_id).sum()
+
+        if not getattr(self.model, "compression", False) :
+            return scores
+
+        # print(f"ForceToCompressTokenLogitsProcessor called. Start tokens: {num_image_start_tokens}, End tokens: {num_image_end_tokens}")
+        generate_this_tok = False
+        # Clone scores so we can measure the CFG-adjusted distribution without mutating it.
+        score_snapshot = scores.clone()
+        device = scores.device
+
+        vocab_indices = torch.arange(score_snapshot.size(-1), device=device)
+        image_token_tensor = self._get_image_token_tensor(device)
+        non_image_mask = ~torch.isin(vocab_indices, image_token_tensor)
+        filtered_scores = score_snapshot.masked_fill(
+            non_image_mask, torch.finfo(score_snapshot.dtype).min
+        )
+
+        probs = torch.nn.functional.softmax(filtered_scores, dim=-1)
+        log_probs = torch.nn.functional.log_softmax(filtered_scores, dim=-1)
+        entropy = -(probs * log_probs).sum(dim=-1) / math.log(2.0)
+        entropy_value = float(entropy[0].item()) if entropy.dim() > 0 else float(entropy.item())
+
+        # Determine to generate or transmit
+        if self._prefilled :
+            if num_image_start_tokens == num_image_end_tokens:
+                # if self._inside_image:
+                #     self._reset()
+                return scores
+            
+            if num_image_start_tokens != num_image_end_tokens + 1:
+                return scores
+
+            # self._inside_image = True
+
+            num_image_tokens = getattr(self.model, "num_image_tokens", 0)
+                
+            # Skip forcing until we've started streaming the latent tokens (prefill or text steps give -1).
+            if corresponding_pos < 0:
+                return scores
+
+            # Once we've seen all image tokens, allow downstream processors to finish without emitting stats again.
+            if corresponding_pos + 1 >= num_image_tokens:
+                self.model.record_compression_step(is_generated=False)
+                return scores
+
+        
+            if self.model.allow_generation and correct_token in self._image_token_set:
+                # print(f"Allow generation for token {correct_token} at position {corresponding_pos}")
+                gen_mode = getattr(self.model, "gen_mode", "None")
+                if gen_mode == "random":
+                    generate_this_tok = torch.rand(1).item() < getattr(self.model, "gen_prob", 0.0)
+                elif gen_mode == "confidence-based":
+                    vocab_size = max(len(self._image_token_set), 1)
+                    max_entropy = math.log2(vocab_size)
+                    confidence = 1 - (entropy_value / max_entropy)
+                    generate_this_tok = confidence > getattr(self.model, "gen_conf_thres", 1.0)
+                elif gen_mode == "confidence-with-map":
+                    confidence_map = getattr(self.model, "confidence_map", None)
+                    assert confidence_map is not None, "confidence_map is None"
+                    rank_list = confidence_map.get("rank", None)
+                    conf_thres = confidence_map.get("thres", -1)
+                    if rank_list is not None and conf_thres != -1:
+                        generate_this_tok = rank_list[corresponding_pos] < getattr(self.model, "gen_conf_thres", 1.0) * len(rank_list)
+                elif gen_mode == "gen-every-n":
+                    interval = max(getattr(self.model, "gen_every_n", 1), 1)
+                    generate_this_tok = (corresponding_pos % interval) == 0
+                else:
+                    raise ValueError(f"Invalid generation mode: {gen_mode}")
+        else: 
+            generate_this_tok = False
+            self._prefilled = True
+
+        if generate_this_tok:
+            self.model.record_compression_step(likelihood=1.0, entropy=entropy_value, is_generated=True)
+            return scores
+
+        if correct_token in self._image_token_set:
+            likelihood_value = float(probs[0, correct_token].item())
+        else:
+            likelihood_value = 1.0
+
+        # Constrain logits so greedy decode must pick the target token.
+        forced_scores = torch.full_like(scores, torch.finfo(scores.dtype).min)
+        forced_scores[:, correct_token] = 0.0
+
+        self.model.record_compression_step(
+            likelihood=likelihood_value,
+            entropy=entropy_value,
+            is_generated=False,
+        )
+        # print all status
+        # print(f"Force Token: {correct_token}, Likelihood: {likelihood_value}, Entropy: {entropy_value}, Generated: {generate_this_tok}")
+        return forced_scores
 
 
 class MultiModalLogitsProcessor(LogitsProcessor):
@@ -184,7 +320,6 @@ class MultiModalLogitsProcessor(LogitsProcessor):
         elif self.num_image_start_tokens == self.num_image_end_tokens + 1:
             if self.image_start_token_id_index is None:
                 self.image_start_token_id_index = torch.where(input_ids[0] == self.image_start_token_id)[0]
-                print(self.image_start_token_id_index)
                 self.image_start_token_id_index = torch.where(input_ids[0] == self.image_start_token_id)[0][-1].item()
 
             new_token_num = len(input_ids[0][self.image_start_token_id_index + 1 :])
@@ -203,12 +338,12 @@ class MultiModalLogitsProcessor(LogitsProcessor):
                 if (len(tokens) + 1) % (self.w_latent_dim + 1) == 0:
                     new_line_constrained_scores = torch.full_like(scores, -math.inf)
                     new_line_constrained_scores[:, self.image_next_line_token_id] = 0
-                    print(f"new line: {len(tokens)+1}")
+                    # print(f"new line: {len(tokens)+1}")
                     return new_line_constrained_scores
                 elif (len(tokens) + 1) == (self.w_latent_dim + 1) * self.h_latent_dim + 1:
                     eos_image_constrained_scores = torch.full_like(scores, -math.inf)
                     eos_image_constrained_scores[:, self.image_end_token_id] = 0
-                    print(f"eos image: {len(tokens)+1}")
+                    # print(f"eos image: {len(tokens)+1}")
                     return eos_image_constrained_scores
                 elif (len(tokens) + 1) % (self.w_latent_dim + 1) != 0:
                     image_constrained_scores = torch.where(self.suppress_token_mask, -float("inf"), scores)
@@ -355,14 +490,15 @@ class FlexARInferenceSolver:
         temperature,
         logits_processor=None,
         streamer=None,
+        condition_images: Image.Image | str | List[Union[Image.Image, str]] = None
     ):
         start_time_cuda_encode = torch.cuda.Event(enable_timing=True)
         end_time_cuda_encode = torch.cuda.Event(enable_timing=True)
         start_time_cuda_decode = torch.cuda.Event(enable_timing=True)
         end_time_cuda_decode = torch.cuda.Event(enable_timing=True)
 
-        import time
-        start_time_encode = time.time()
+        # import time
+        # start_time_encode = time.time()
         start_time_cuda_encode.record()
 
         conversations = []
@@ -381,51 +517,70 @@ class FlexARInferenceSolver:
             )
         item = {"image": images, "conversations": conversations}
 
-        
-        image_tokens, _prompt = self.item_processor.tokenize_item(item)
+        # get the to-compress-image tokens
+        image_tokens, _ = self.item_processor.tokenize_item(item)
+        len_image_tokens = len(image_tokens)
+
+        if condition_images is None:
+            item["image"] = []
+        else:
+            item = {"image": condition_images, "conversations": conversations}
+
+        # format of _prompts (example): _prompt = [101, 2054, {"input_ids": [8804, 8805, 8806]}, 2058]
+        _prompt = self.item_processor.process_item(item)
+
+        if max_gen_len == -1:
+            max_gen_len = 1 + len_image_tokens
+            print(f"Set max_gen_len to {max_gen_len}")
         
         prompt = []
         for value in _prompt:
-            if isinstance(value, int):
+            if isinstance(value, int): 
                 prompt.append(value)
             else:
                 prompt += value["input_ids"]
+
+        print(f"Image Tokens(len{len_image_tokens}): {image_tokens[:10]}...{image_tokens[-10:]}")
+        print(f"Prompt Tokens(len{len(prompt)}): {prompt[:10]}...{prompt[-10:]}")
         prompt_len = len(prompt)
         prompt = torch.tensor(prompt, dtype=torch.int64, device=self.model.device).unsqueeze(0)
-
+        
         generation_config = GenerationConfig(
             max_new_tokens=max_gen_len,
             max_length=self.model.config.max_position_embeddings,
             temperature=temperature,
             top_k=None,
-            do_sample=True,
+            do_sample=False,
             eos_token_id=[8710],
         )
 
         if logits_processor is None:
             logits_processor = self.create_logits_processor()
 
-        start_time_decode = time.time()
+        # self.model.image_start_pos = image_start_pos
+        self.model.num_image_tokens = len_image_tokens
+        self.model.to_compressed_tok = image_tokens
+
+        # start_time_decode = time.time()
         start_time_cuda_decode.record()
         
         with torch.cuda.amp.autocast(dtype=self.dtype):
-            # import pdb; pdb.set_trace()
             outputs = self.model.generate(
                 prompt, generation_config, logits_processor=logits_processor, streamer=streamer
             )
             generation_result = outputs[0][prompt_len:].tolist()
-            
+            print(f"Generated tokens(len{len(generation_result)}): {generation_result[:10]}...{generation_result[-10:]}")
             if len(generation_result) > 0 and generation_result[-1] == 8710:
                 generation_result = generation_result[:-1]
         
-        end_time_encode = time.time()
+        # end_time_encode = time.time()
         end_time_cuda_encode.record()
         torch.cuda.synchronize()
         
         # output = self.decode_ids(image_tokens)
         output = self.decode_ids(generation_result)
         
-        end_time_decode = time.time()
+        # end_time_decode = time.time()
         end_time_cuda_decode.record()
         torch.cuda.synchronize()
         
@@ -492,6 +647,12 @@ class FlexARInferenceSolver:
             patch_size=32,
         )
 
+        force_processor = ForceToCompressTokenLogitsProcessor(
+            model=self.model,
+            image_start_token_id=self.item_processor.token2id(self.item_processor.image_start_token),
+            image_end_token_id=self.item_processor.token2id(self.item_processor.image_end_token),
+        )
+
         candidate_processor = MultiModalLogitsProcessor(
             image_start_token_id=self.item_processor.token2id(self.item_processor.image_start_token),
             image_end_token_id=self.item_processor.token2id(self.item_processor.image_end_token),
@@ -506,8 +667,10 @@ class FlexARInferenceSolver:
             image_start_token_id=self.item_processor.token2id(self.item_processor.image_start_token),
             image_end_token_id=self.item_processor.token2id(self.item_processor.image_end_token),
         )
-
+        
         logits_processor.append(cfg_processor)
+        # Force processor must see CFG-adjusted logits before structural constraints kick in.
+        logits_processor.append(force_processor)
         logits_processor.append(candidate_processor)
         logits_processor.append(topk_processor)
 
