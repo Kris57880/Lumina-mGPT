@@ -167,7 +167,7 @@ for i, image_name in enumerate(img_list):
     
     if args.enable_img_cond:
         print("  使用條件圖片進行壓縮")
-        description =  "Generate an image of 768x768 according to this low-resolution image <|image|>. Preserve the original content, composition, and colors. Enhance sharpness, texture, and fine details WITHOUT altering the scene or adding new elements."
+        description =  f"Generate an image of {args.input_size}x{args.input_size} according to this low-resolution image <|image|>. Preserve the original content, composition, and colors. Enhance sharpness, texture, and fine details WITHOUT altering the scene or adding new elements."
     description_bits = len(description) * 8 
     if len(description) > 0:
         print(f"Use description (len: {len(description)}/ bits: {description_bits}): {description}")  # 只顯示前 100 個字元
