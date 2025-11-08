@@ -147,12 +147,11 @@ class ForceToCompressTokenLogitsProcessor(LogitsProcessor):
         self._image_token_set = set(self.model.model.vocabulary_mapping.image_tokens)
         self._image_token_tensor = None
         self._prefilled = False
-        print(f'Image start token id: {self.image_start_token_id}, Image end token id: {self.image_end_token_id}, Number of image tokens: {len(self._image_token_set)}')
+        # self._confidence_discount = 1 # do annealing for confidence-based generation
+        self._temperature = 1.0
+        # self.compress_token_mask = None
+        # print(f'Image start token id: {self.image_start_token_id}, Image end token id: {self.image_end_token_id}, Number of image tokens: {len(self._image_token_set)}')
     
-    # def _reset(self):
-    #     self._inside_image = False
-    #     self._image_token_tensor = None
-    #     self.model.current_compression_pos = -1
 
     def _get_image_token_tensor(self, device):
         if self._image_token_tensor is None or self._image_token_tensor.device != device:
@@ -168,6 +167,13 @@ class ForceToCompressTokenLogitsProcessor(LogitsProcessor):
         if corresponding_pos >= len(self.model.to_compressed_tok): # Out of bounds
             return scores
         
+        # if self.compress_token_mask is None :# create a mask to filter out tokens not in to_compressed_tok
+        #     device = scores.device
+        #     vocab_size = scores.size(-1)
+        #     vocab_indices = torch.arange(vocab_size, device=device)
+        #     to_compress_token_tensor = torch.tensor(self.model.to_compressed_tok, device=device, dtype=torch.long)
+        #     self.compress_token_mask = ~torch.isin(vocab_indices, to_compress_token_tensor)
+
         correct_token = int(self.model.to_compressed_tok[corresponding_pos])
         # print(f'Correct token to force: {correct_token}')
         num_image_start_tokens = (input_ids[0] == self.image_start_token_id).sum()
@@ -188,9 +194,12 @@ class ForceToCompressTokenLogitsProcessor(LogitsProcessor):
         filtered_scores = score_snapshot.masked_fill(
             non_image_mask, torch.finfo(score_snapshot.dtype).min
         )
+        # filtered_scores = filtered_scores.masked_fill(
+        #     self.compress_token_mask, torch.finfo(score_snapshot.dtype).min
+        # )
 
-        probs = torch.nn.functional.softmax(filtered_scores, dim=-1)
-        log_probs = torch.nn.functional.log_softmax(filtered_scores, dim=-1)
+        probs = torch.nn.functional.softmax(filtered_scores/self._temperature, dim=-1)
+        log_probs = torch.nn.functional.log_softmax(filtered_scores/self._temperature, dim=-1)
         entropy = -(probs * log_probs).sum(dim=-1) / math.log(2.0)
         entropy_value = float(entropy[0].item()) if entropy.dim() > 0 else float(entropy.item())
 
@@ -227,7 +236,20 @@ class ForceToCompressTokenLogitsProcessor(LogitsProcessor):
                     vocab_size = max(len(self._image_token_set), 1)
                     max_entropy = math.log2(vocab_size)
                     confidence = 1 - (entropy_value / max_entropy)
-                    generate_this_tok = confidence > getattr(self.model, "gen_conf_thres", 1.0)
+                    # confidence*= self._confidence_discount
+                    if confidence > getattr(self.model, "gen_conf_thres", 1.0):
+                        # self._confidence_discount *=0.9
+                        generate_this_tok = True
+                    # else:
+                    #     self._confidence_discount =1
+                elif gen_mode == "confidence-random":
+                    vocab_size = max(len(self._image_token_set), 1)
+                    max_entropy = math.log2(vocab_size)
+                    confidence = 1 - (entropy_value / max_entropy)
+                    conf_thres = getattr(self.model, "gen_conf_thres", 1.0)
+                    generate_this_tok=False
+                    if confidence > conf_thres:
+                        generate_this_tok = torch.rand(1).item() < getattr(self.model, "gen_prob", 0.0)
                 elif gen_mode == "confidence-with-map":
                     confidence_map = getattr(self.model, "confidence_map", None)
                     assert confidence_map is not None, "confidence_map is None"
@@ -518,9 +540,39 @@ class FlexARInferenceSolver:
         item = {"image": images, "conversations": conversations}
 
         # get the to-compress-image tokens
+        _image_token_set = set(self.model.model.vocabulary_mapping.image_tokens)
         image_tokens, _ = self.item_processor.tokenize_item(item)
-        len_image_tokens = len(image_tokens)
+        """
+        padded_token= 8803
+        reduced_img_toks = [8197, 8804+48//4, 8804+48//4]  # image start token + height + width
+        new_line_indicator = 24
+        for i, tok in enumerate(image_tokens[3:-1]):
+            row= i // 49
+            col= i % 49
+            if row%2==0 and col%2==0:
+                if tok in _image_token_set:
+                    reduced_img_toks.append(tok)
+                    new_line_indicator -=1
+                else:
+                    print(f"Warning: token {tok} at position {i} is not in image token set.")
+            if new_line_indicator == 0:
+                new_line_indicator = 24
+                reduced_img_toks.append(padded_token)  # new line token
+        reduced_img_toks.append(8196)  # image end token    
+        print("Original image tokens:")
+        for i in range(len(image_tokens)):
+            print(f"{image_tokens[i]:<5}", end='')
+            if image_tokens[i] == 8803:
+                print('')
+        print("\nReduced image tokens:")
+        image_tokens = reduced_img_toks
+        for i in range(len(image_tokens)):
+            print(f"{image_tokens[i]:<5}", end='')
+            if image_tokens[i] == 8803:
+                print('')
+        """
 
+        len_image_tokens = len(image_tokens)
         if condition_images is None:
             item["image"] = []
         else:
@@ -528,7 +580,6 @@ class FlexARInferenceSolver:
 
         # format of _prompts (example): _prompt = [101, 2054, {"input_ids": [8804, 8805, 8806]}, 2058]
         _prompt = self.item_processor.process_item(item)
-
         if max_gen_len == -1:
             max_gen_len = 1 + len_image_tokens
             print(f"Set max_gen_len to {max_gen_len}")
@@ -542,6 +593,8 @@ class FlexARInferenceSolver:
 
         print(f"Image Tokens(len{len_image_tokens}): {image_tokens[:10]}...{image_tokens[-10:]}")
         print(f"Prompt Tokens(len{len(prompt)}): {prompt[:10]}...{prompt[-10:]}")
+        print(f"Prompt tokens: {prompt}")
+        
         prompt_len = len(prompt)
         prompt = torch.tensor(prompt, dtype=torch.int64, device=self.model.device).unsqueeze(0)
         
@@ -556,7 +609,8 @@ class FlexARInferenceSolver:
 
         if logits_processor is None:
             logits_processor = self.create_logits_processor()
-
+            
+        logits_processor[1]._temperature = temperature # ForceToCompressTokenLogitsProcessor
         # self.model.image_start_pos = image_start_pos
         self.model.num_image_tokens = len_image_tokens
         self.model.to_compressed_tok = image_tokens
@@ -570,6 +624,7 @@ class FlexARInferenceSolver:
             )
             generation_result = outputs[0][prompt_len:].tolist()
             print(f"Generated tokens(len{len(generation_result)}): {generation_result[:10]}...{generation_result[-10:]}")
+            print(f"Generated tokens: {generation_result}")
             if len(generation_result) > 0 and generation_result[-1] == 8710:
                 generation_result = generation_result[:-1]
         
@@ -670,7 +725,7 @@ class FlexARInferenceSolver:
         
         logits_processor.append(cfg_processor)
         # Force processor must see CFG-adjusted logits before structural constraints kick in.
-        logits_processor.append(force_processor)
+        logits_processor.append(force_processor)  
         logits_processor.append(candidate_processor)
         logits_processor.append(topk_processor)
 

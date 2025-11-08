@@ -76,7 +76,9 @@ class FlexARItemProcessor(MMConvItemProcessor):
         )
 
         self.patch_size = 32
-        self.crop_size_list = generate_crop_size_list((target_size // self.patch_size) ** 2, self.patch_size)
+        # self.crop_size_list = generate_crop_size_list((target_size // self.patch_size) ** 2, self.patch_size)
+        self.crop_size_list =[(target_size, target_size)]
+        print(f'crop_size_list: {self.crop_size_list}')
         logger.info("List of crop sizes:")
         for i in range(0, len(self.crop_size_list), 6):
             logger.info(" " + "".join([f"{f'{w} x {h}':14s}" for w, h in self.crop_size_list[i : i + 6]]))

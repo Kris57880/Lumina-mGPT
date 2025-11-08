@@ -56,11 +56,13 @@ parser.add_argument('--output_folder', type=str, default="results/kodak_gen", he
 parser.add_argument('--cfg', type=float, default=1.0, help='CFG scale for logits processor (default: 1.0/disabled)')
 parser.add_argument('--enable_img_cond', action='store_true', help='Use condition images during compression')
 parser.add_argument('--cond_size', type=int, default=256, help='Use smaller image to help entropy coding, conditioning image size (default: 256)')
+parser.add_argument('--cond_folder', type=str, default="", help='Path to condition image folder')
 args = parser.parse_args()
 
 inference_solver = FlexARInferenceSolver(
+    # model_path="Alpha-VLLM/Lumina-mGPT-34B-512",
     model_path="Alpha-VLLM/Lumina-mGPT-7B-768-Omni",
-    # model_path="Alpha-VLLM/Lumina-mGPT-7B-768",
+    # model_path="Alpha-VLLM/Lumina-mGPT-7B-512",
     precision="fp16",
     target_size=args.input_size,
 )
@@ -154,12 +156,19 @@ for i, image_name in enumerate(img_list):
     # 載入圖片
     original_image = Image.open(image_path)
     images = [original_image]
+
+    # load the same-name image from conditional folder
+    if args.cond_folder:
+        cond_image_path = os.path.join(args.cond_folder, image_name)
+        assert os.path.exists(cond_image_path), f"警告: 找不到條件圖片: {cond_image_path}"
+        conditional_image = Image.open(cond_image_path)
+        conditional_images = [conditional_image]
     
     # 構建 description，包含 caption 資訊
     description = ""
     # 從 caption_dict 中獲取該圖片的 caption
     if image_name in caption_dict:
-        description = "Generate an image of 768x768 according to the following prompt:\n"
+        description = f"Generate an image of {args.input_size}x{args.input_size} according to the following prompt:\n"
         caption = caption_dict[image_name]
         description += caption
     else:
@@ -167,7 +176,7 @@ for i, image_name in enumerate(img_list):
     
     if args.enable_img_cond:
         print("  使用條件圖片進行壓縮")
-        description =  f"Generate an image of {args.input_size}x{args.input_size} according to this low-resolution image <|image|>. Preserve the original content, composition, and colors. Enhance sharpness, texture, and fine details WITHOUT altering the scene or adding new elements."
+        description =  f"Generate an image of {args.input_size}x{args.input_size} according to the provided low-resolution image. Preserve the original content, composition, and colors. Enhance sharpness, texture, and fine details WITHOUT altering the scene or adding new elements.<|image|>"
     description_bits = len(description) * 8 
     if len(description) > 0:
         print(f"Use description (len: {len(description)}/ bits: {description_bits}): {description}")  # 只顯示前 100 個字元
@@ -212,12 +221,12 @@ for i, image_name in enumerate(img_list):
     inference_solver.model.prefilled = False 
 
     generated = inference_solver.compress(
-        images=images,
+        images= images,
         qas=qas,
         max_gen_len=-1,
-        temperature=1.0,
+        temperature=1,
         logits_processor= inference_solver.create_logits_processor(cfg=args.cfg, image_top_k=200),
-        condition_images= [img.resize((args.cond_size, args.cond_size)) for img in images] if args.enable_img_cond else None,
+        condition_images=conditional_images if (args.enable_img_cond and conditional_images) else None,
     )
     
     torch.cuda.synchronize() # Ensures the "kernel" completes before recording the end event
